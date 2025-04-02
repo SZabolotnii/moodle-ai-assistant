@@ -1439,12 +1439,40 @@ class TeacherDashboard:
             "mode": self.mode,
             "system_prompt": "Ви корисний асистент для викладача навчальної платформи Moodle. " +
                             f"Ви працюєте в режимі '{self.mode}'. " +
-                            "Надавайте корисні поради, аналітику та допомогу в роботі з курсом. " +
+                            "У вас є прямий доступ до даних Moodle, включаючи інформацію про курс, студентів та завдання. " +
+                            "Використовуйте ці дані для надання детальних і точних відповідей. " +
                             "Відповідайте українською мовою, якщо явно не зазначено інше."
         }
         
         if self.selected_course:
             context["course"] = self.selected_course_name or f"Курс ID: {self.selected_course}"
+            
+            # Додаємо дані про студентів (обмежуємо для запобігання перевищення контексту)
+            if self.students:
+                # Обмежуємо до 100 студентів для запобігання перевищення контексту
+                max_students = min(len(self.students), 100)
+                students_data = []
+                for i in range(max_students):
+                    student = self.students[i]
+                    students_data.append({
+                        "id": student.get('id', 'N/A'),
+                        "name": student.get('fullname', 'N/A'),
+                        "email": student.get('email', 'N/A')
+                    })
+                context["students"] = students_data
+                context["student_count"] = len(self.students)
+            
+            # Додаємо дані про завдання
+            if self.assignments:
+                assignments_data = []
+                for assignment in self.assignments:
+                    assignments_data.append({
+                        "id": assignment.get('id', 'N/A'),
+                        "name": assignment.get('name', 'Без назви'),
+                        "duedate": assignment.get('duedate', 'Не встановлено'),
+                        "submissions": assignment.get('submissions', 0)
+                    })
+                context["assignments"] = assignments_data
         
         try:
             # Додаємо до історії перед отриманням відповіді, щоб показати повідомлення одразу
