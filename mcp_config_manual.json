@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "moodle-assistant": {
+      "command": "/home/docsa/CursorProjects/moodle-ai-assistant/venv/bin/python",
+      "args": [
+        "/home/docsa/CursorProjects/moodle-ai-assistant/mcp_server/moodle_server.py",
+        "--base-url",
+        "http://78.137.2.119:2929"
+      ]
+    }
+  }
+}
