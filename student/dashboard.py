@@ -14,7 +14,7 @@ except ImportError:
 try:
     from common.llm_provider import LLMProviderFactory
 except ImportError:
-    from llm_provider import LLMProviderFactory
+    from common.llm_provider import LLMProviderFactory
 
 class StudentDashboard:
     """Клас для інтерфейсу студента."""
