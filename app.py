@@ -219,5 +219,5 @@ if __name__ == "__main__":
     demo = create_interface()
     print("Запуск інтерфейсу Gradio...")
     # share=True для публічного доступу (опціонально)
-    demo.launch(share=False)
+    demo.launch(share=True)
     print("Додаток Gradio запущено.")
