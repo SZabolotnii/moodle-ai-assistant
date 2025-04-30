@@ -1446,51 +1446,39 @@ class TeacherDashboard:
                 self.messages.append((message, f"Помилка ініціалізації LLM провайдера: {e}. Будь ласка, спочатку ініціалізуйте провайдера."))
                 return self.messages, ""
         
-        # Підготовка контексту
+        # Підготовка базового контексту
         context = {
             "user_id": self.auth.user_id,
             "user_role": "teacher",
             "mode": self.mode,
+            "selected_course": self.selected_course,
+            "selected_course_name": self.selected_course_name,
             "system_prompt": "Ви корисний асистент для викладача навчальної платформи Moodle. " +
                             f"Ви працюєте в режимі '{self.mode}'. " +
-                            "У вас є прямий доступ до даних Moodle, включаючи інформацію про курс, студентів та завдання. " +
-                            "Використовуйте ці дані для надання детальних і точних відповідей. " +
+                            "У вас є доступ до даних Moodle через MCP сервер. " +
+                            "Для отримання даних використовуйте наступні інструменти:\n" +
+                            "1. core_course_get_courses - отримання інформації про курси\n" +
+                            "2. core_course_get_contents - отримання вмісту курсу\n" +
+                            "3. core_enrol_get_enrolled_users - отримання списку студентів\n" +
+                            "4. mod_assign_get_assignments - отримання завдань\n" +
+                            "5. mod_assign_get_submissions - отримання зданих робіт\n" +
+                            "6. gradereport_user_get_grade_items - отримання оцінок\n" +
+                            "7. core_user_get_users_by_field - отримання інформації про користувачів\n" +
                             "Відповідайте українською мовою, якщо явно не зазначено інше."
         }
         
-        if self.selected_course:
-            # Отримання повної інформації про курс
-            course_info = await self.get_course_info()
-            context["course"] = {
-                "id": self.selected_course,
-                "name": self.selected_course_name,
-                "info": course_info
-            }
-            
-            # Отримання повної інформації про студентів
-            students_data = await self.get_course_students()
-            if students_data and "students" in students_data:
-                # Обмежуємо до 50 студентів для запобігання перевищення контексту
-                max_students = min(len(students_data["students"]), 50)
-                context["students"] = students_data["students"][:max_students]
-                context["student_count"] = len(students_data["students"])
-            
-            # Отримання інформації про завдання
-            assignments_data = await self.get_course_assignments()
-            if assignments_data and "assignments" in assignments_data:
-                context["assignments"] = assignments_data["assignments"]
-            
-            # Отримання статистики оцінок
-            grades_stats = await self.get_grades_statistics()
-            if grades_stats:
-                context["grades_statistics"] = grades_stats
-        
         try:
-            # Додаємо до історії перед отриманням відповіді, щоб показати повідомлення одразу
+            # Додаємо до історії перед отриманням відповіді
             self.messages.append((message, None))
             
-            # Отримання відповіді від LLM
-            response = await self.llm_provider.generate_response(message, context)
+            # Отримання відповіді від LLM з можливістю використання MCP
+            response = await self.llm_provider.generate_response(
+                message, 
+                context,
+                use_mcp=True,  # Дозволяємо використання MCP
+                mcp_server_url=self.moodle_url,
+                mcp_token=self.auth.token
+            )
             
             # Оновлення останнього повідомлення в історії з відповіддю
             self.messages[-1] = (message, response)

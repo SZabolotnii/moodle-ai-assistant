@@ -51,21 +51,12 @@ class ClaudeProvider(LLMProvider):
             return False
             
         # Перевірка необхідних полів у контексті
-        required_fields = ["user_role"]
+        required_fields = ["user_role", "mcp_server_url", "mcp_token"]
         if not all(field in context for field in required_fields):
-            print("Помилка: Відсутні обов'язкові поля в контексті")
+            print("Помилка: Відсутні обов'язкові поля в контексті для MCP")
             return False
             
-        # Перевірка доступу до даних курсу
-        if "course" in context:
-            try:
-                # Якщо є інформація про курс, вважаємо що доступ дозволено
-                return True
-            except Exception as e:
-                print(f"Помилка перевірки доступу до курсу: {e}")
-                return False
-        
-        return True  # Якщо немає специфічних перевірок, дозволяємо доступ
+        return True
     
     async def validate_context(self, context: Dict[str, Any]) -> bool:
         """Валідація даних в контексті"""
@@ -73,26 +64,45 @@ class ClaudeProvider(LLMProvider):
         if not all(field in context for field in required_fields):
             return False
         
-        # Додаткові перевірки специфічних полів
-        if "course" in context:
-            if not isinstance(context["course"], dict):
+        # Додаткові перевірки для MCP
+        if context.get("use_mcp", False):
+            if not all(field in context for field in ["mcp_server_url", "mcp_token"]):
                 return False
+        
         return True
     
     async def get_cached_response(self, prompt: str, context: Dict[str, Any]) -> Optional[str]:
         cache_key = f"{prompt}:{json.dumps(context)}"
         return self.cache.get(cache_key)
     
-    async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
+    async def _call_mcp_api(self, function: str, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """Виклик API через MCP сервер"""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{context['mcp_server_url']}/webservice/rest/server.php",
+                    params={
+                        "wstoken": context["mcp_token"],
+                        "wsfunction": function,
+                        "moodlewsrestformat": "json",
+                        **params
+                    }
+                )
+                response.raise_for_status()
+                return response.json()
+        except Exception as e:
+            print(f"Помилка виклику MCP API: {e}")
+            return {"error": str(e)}
+    
+    async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None, use_mcp: bool = False, mcp_server_url: Optional[str] = None, mcp_token: Optional[str] = None) -> str:
         """Генерація відповіді з використанням API Claude."""
-        # Додати логування
         print(f"Генерація відповіді для користувача {context.get('user_id')} в режимі {context.get('mode')}")
         if not self.api_key:
             return "Помилка: API ключ для Claude не налаштовано. Додайте ANTHROPIC_API_KEY у файл .env."
         
-        # Спочатку перевіряємо доступ
-        if context and not await self.validate_mcp_access(context):
-            return "Помилка: Немає прав доступу до даних через MCP сервер"
+        # Валідація контексту
+        if context and not await self.validate_context(context):
+            return "Помилка: Некоректний контекст"
         
         if len(prompt) > MAX_PROMPT_LENGTH:
             return "Помилка: Занадто довгий запит"
@@ -100,37 +110,55 @@ class ClaudeProvider(LLMProvider):
         if context and len(json.dumps(context)) > MAX_CONTEXT_SIZE:
             return "Помилка: Занадто великий контекст"
         
-        headers = {
-            "x-api-key": self.api_key,
-            "content-type": "application/json",
-            "anthropic-version": "2023-06-01"
-        }
+        # Додавання MCP параметрів до контексту
+        if use_mcp and mcp_server_url and mcp_token:
+            if not context:
+                context = {}
+            context.update({
+                "use_mcp": True,
+                "mcp_server_url": mcp_server_url,
+                "mcp_token": mcp_token
+            })
         
-        # Підготовка системного промпту на основі контексту
+        # Підготовка системного промпту
         system_prompt = """Ви корисний асистент для навчальної платформи Moodle. 
         Ти отримуєш інформацію про навчальні дисципліни та активність студентів через MCP сервер.
+        Для отримання даних використовуй наступні інструменти:
+        1. core_course_get_courses - отримання інформації про курси
+        2. core_course_get_contents - отримання вмісту курсу
+        3. core_enrol_get_enrolled_users - отримання списку студентів
+        4. mod_assign_get_assignments - отримання завдань
+        5. mod_assign_get_submissions - отримання зданих робіт
+        6. gradereport_user_get_grade_items - отримання оцінок
+        7. core_user_get_users_by_field - отримання інформації про користувачів
+        
         Не використовуй жодних інших джерел для відповіді.
         Відповідайте українською мовою, якщо явно не зазначено інше."""
         
         if context:
             if "system_prompt" in context:
                 system_prompt = context["system_prompt"]
-            else:
-                # Додавання контекстної інформації
-                context_text = []
-                if "course" in context:
-                    context_text.append(f"Інформація про курс: {context['course']}")
-                if "assignments" in context:
-                    context_text.append(f"Завдання курсу: {context['assignments']}")
-                if "students" in context:
-                    context_text.append(f"Студенти курсу: {context['students']}")
-                if "user_role" in context:
-                    context_text.append(f"Роль користувача: {context['user_role']}")
-                if "mode" in context:
-                    context_text.append(f"Режим: {context['mode']}")
-                
-                if context_text:
-                    system_prompt += "\n\n" + "\n".join(context_text)
+            
+            # Додавання базової інформації про користувача та курс
+            context_text = []
+            if "user_role" in context:
+                context_text.append(f"Роль користувача: {context['user_role']}")
+            if "mode" in context:
+                context_text.append(f"Режим: {context['mode']}")
+            if "selected_course" in context:
+                context_text.append(f"Обраний курс ID: {context['selected_course']}")
+            if "selected_course_name" in context:
+                context_text.append(f"Назва курсу: {context['selected_course_name']}")
+            
+            if context_text:
+                system_prompt += "\n\n" + "\n".join(context_text)
+        
+        # Підготовка запиту до Claude
+        headers = {
+            "x-api-key": self.api_key,
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01"
+        }
         
         data = {
             "model": self.model,
@@ -149,7 +177,7 @@ class ClaudeProvider(LLMProvider):
                 response.raise_for_status()
                 result = response.json()
                 
-                # Отримання текстової відповіді з JSON-відповіді Claude API
+                # Отримання текстової відповіді
                 content = result.get("content", [])
                 text_chunks = []
                 
