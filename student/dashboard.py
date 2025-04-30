@@ -43,12 +43,13 @@ class StudentDashboard:
                         gr.Markdown("### Інформація про студента")
                         user_info_output = gr.Textbox(label="Профіль", interactive=False, lines=6, value="Завантаження...")
                         
-                        # Оновлюємо інформацію, якщо є токен
-                        if self.auth.token and self.auth.user_id:
+                        # Оновлюємо інформацію тільки після успішної автентифікації
+                        if self.auth.authenticated and self.auth.token and self.auth.user_id:
                             asyncio.create_task(self.update_user_info(user_info_output))
                         else:
-                            # Пряме присвоєння значення замість update
-                            user_info_output.value = "Помилка: Автентифікація не пройдена (перевірте токен)."
+                            auth_error_msg = "Очікування автентифікації..."
+                            user_info_output.value = auth_error_msg
+                            print(auth_error_msg)
                     
                     # Блок курсів
                     with gr.Group() as courses_group:
@@ -525,12 +526,48 @@ class StudentDashboard:
         
         # Підготовка контексту
         context = {
+            "user_id": self.auth.user_id,
             "user_role": "student",
+            "mode": "chat",
             "system_prompt": "Ви корисний асистент для навчальної платформи Moodle, що допомагає студенту. Надавайте пояснення, рекомендації для навчання та допомогу в розумінні матеріалів курсу. Не надавайте готових відповідей на завдання чи тести. Відповідайте українською мовою, якщо явно не зазначено інше."
         }
         
+        # Додавання інформації про курс, якщо він вибраний
         if self.selected_course:
-            context["course"] = self.selected_course_name or f"Курс ID: {self.selected_course}"
+            context["course"] = {
+                "id": self.selected_course,
+                "name": self.selected_course_name
+            }
+            
+            # Отримання інформації про курс
+            try:
+                success, course_info = await self.auth._call_api("core_course_get_courses", {
+                    "options[ids][0]": self.selected_course
+                })
+                if success and course_info:
+                    context["course_info"] = course_info[0]
+            except Exception as e:
+                print(f"Помилка отримання інформації про курс: {e}")
+            
+            # Отримання завдань курсу
+            try:
+                success, assignments = await self.auth._call_api("mod_assign_get_assignments", {
+                    "courseids[0]": self.selected_course
+                })
+                if success and assignments:
+                    context["assignments"] = assignments.get("courses", [{}])[0].get("assignments", [])
+            except Exception as e:
+                print(f"Помилка отримання завдань курсу: {e}")
+            
+            # Отримання вмісту курсу
+            try:
+                success, content = await self.auth._call_api("core_course_get_contents", {
+                    "courseid": self.selected_course
+                })
+                if success and content:
+                    context["course_content"] = content
+            except Exception as e:
+                print(f"Помилка отримання вмісту курсу: {e}")
         
         try:
             # Додаємо до історії перед отриманням відповіді, щоб показати повідомлення одразу

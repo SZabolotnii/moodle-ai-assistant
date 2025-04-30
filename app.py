@@ -30,7 +30,7 @@ class AppState:
 app_state = AppState()
 
 # Функція для переходу в режим викладача
-async def switch_to_teacher_mode_async():
+def switch_to_teacher_mode():
     """
     Перемикання в режим викладача.
     """
@@ -48,40 +48,45 @@ async def switch_to_teacher_mode_async():
         )
     
     print("Спроба автентифікації за токеном...")
-    success, message = await auth.authenticate_with_token()
-    
-    if success:
-        print(f"Автентифікація успішна. User ID: {auth.user_id}, Is Teacher: {auth.is_teacher}")
-        if not auth.is_teacher:
-            warning_message = "Попередження: Акаунт, пов'язаний з токеном, не має прав викладача в жодному курсі."
-            print(warning_message)
-            return (
-                gr.update(visible=False),  # mode_selection
-                gr.update(visible=False),  # student_mode
-                gr.update(visible=True),   # teacher_dashboard
-                gr.update(value=warning_message, visible=True)  # status_message
-            )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        success, message = loop.run_until_complete(auth.authenticate_with_token())
+        
+        if success:
+            print(f"Автентифікація успішна. User ID: {auth.user_id}, Is Teacher: {auth.is_teacher}")
+            if not auth.is_teacher:
+                warning_message = "Попередження: Акаунт, пов'язаний з токеном, не має прав викладача в жодному курсі."
+                print(warning_message)
+                return (
+                    gr.update(visible=False),  # mode_selection
+                    gr.update(visible=False),  # student_mode
+                    gr.update(visible=True),   # teacher_dashboard
+                    gr.update(value=warning_message, visible=True)  # status_message
+                )
+            else:
+                # Успіх і є викладачем
+                return (
+                    gr.update(visible=False),  # mode_selection
+                    gr.update(visible=False),  # student_mode
+                    gr.update(visible=True),   # teacher_dashboard
+                    gr.update(value="Автентифікація за токеном успішна.", visible=False)  # status_message
+                )
         else:
-            # Успіх і є викладачем
+            # Помилка автентифікації
+            error_message = f"Помилка автентифікації за токеном: {message}"
+            print(error_message)
             return (
-                gr.update(visible=False),  # mode_selection
+                gr.update(visible=True),   # mode_selection
                 gr.update(visible=False),  # student_mode
-                gr.update(visible=True),   # teacher_dashboard
-                gr.update(value="Автентифікація за токеном успішна.", visible=False)  # status_message
+                gr.update(visible=False),  # teacher_dashboard
+                gr.update(value=error_message, visible=True)  # status_message
             )
-    else:
-        # Помилка автентифікації
-        error_message = f"Помилка автентифікації за токеном: {message}"
-        print(error_message)
-        return (
-            gr.update(visible=True),   # mode_selection
-            gr.update(visible=False),  # student_mode
-            gr.update(visible=False),  # teacher_dashboard
-            gr.update(value=error_message, visible=True)  # status_message
-        )
+    finally:
+        loop.close()
 
 # Функція для переходу в режим студента
-async def switch_to_student_mode_async():
+def switch_to_student_mode():
     """
     Перемикання в режим студента.
     """
@@ -99,26 +104,31 @@ async def switch_to_student_mode_async():
         )
     
     print("Спроба автентифікації за токеном (режим студента)...")
-    success, message = await auth.authenticate_with_token()
-    
-    if success:
-        print(f"Автентифікація успішна. User ID: {auth.user_id}")
-        return (
-            gr.update(visible=False),  # mode_selection
-            gr.update(visible=True),   # student_mode
-            gr.update(visible=False),  # teacher_dashboard
-            gr.update(visible=False)   # status_message
-        )
-    else:
-        # Помилка автентифікації
-        error_message = f"Помилка автентифікації за токеном: {message}"
-        print(error_message)
-        return (
-            gr.update(visible=True),   # mode_selection
-            gr.update(visible=False),  # student_mode
-            gr.update(visible=False),  # teacher_dashboard
-            gr.update(value=error_message, visible=True)  # status_message
-        )
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        success, message = loop.run_until_complete(auth.authenticate_with_token())
+        
+        if success:
+            print(f"Автентифікація успішна. User ID: {auth.user_id}")
+            return (
+                gr.update(visible=False),  # mode_selection
+                gr.update(visible=True),   # student_mode
+                gr.update(visible=False),  # teacher_dashboard
+                gr.update(visible=False)   # status_message
+            )
+        else:
+            # Помилка автентифікації
+            error_message = f"Помилка автентифікації за токеном: {message}"
+            print(error_message)
+            return (
+                gr.update(visible=True),   # mode_selection
+                gr.update(visible=False),  # student_mode
+                gr.update(visible=False),  # teacher_dashboard
+                gr.update(value=error_message, visible=True)  # status_message
+            )
+    finally:
+        loop.close()
 
 # Функція для повернення до вибору режиму
 def back_to_selection():
@@ -167,13 +177,13 @@ def create_interface():
         
         # Логіка кнопок
         teacher_btn.click(
-            fn=switch_to_teacher_mode_async,
+            fn=switch_to_teacher_mode,
             inputs=[],
             outputs=[mode_selection, student_mode, teacher_dashboard, status_message]
         )
         
         student_btn.click(
-            fn=switch_to_student_mode_async,
+            fn=switch_to_student_mode,
             inputs=[],
             outputs=[mode_selection, student_mode, teacher_dashboard, status_message]
         )

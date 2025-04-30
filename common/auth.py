@@ -22,6 +22,7 @@ class MoodleAuth:
         """
         self.base_url = base_url
         self.token = token # Спочатку встановлюємо з аргументу (якщо передано)
+        self.authenticated = False  # Додаємо флаг стану автентифікації
 
         # Якщо токен не передано через аргумент, пробуємо завантажити з .env
         if self.token is None:
@@ -64,47 +65,61 @@ class MoodleAuth:
         is_valid, msg = await self.is_token_valid()
 
         if not is_valid:
-            self.token = None # Скидаємо невалідний токен
+            self.token = None
+            self.authenticated = False
             print(f"Помилка: Наданий токен недійсний або термін дії закінчився. {msg}")
             return False, f"Наданий токен недійсний: {msg}"
 
         print("Токен дійсний. Отримання інформації про користувача...")
-        # Якщо токен валідний, is_token_valid вже викликав _get_user_info
-        # і встановив user_id. Треба тільки перевірити результат.
-        if not self.user_id: # Якщо ID не встановився (малоймовірно, якщо is_token_valid=True)
-             info_ok, info_msg = await self._get_user_info()
-             if not info_ok:
-                 # Це не повинно трапитись, якщо is_token_valid повернув True
-                 print(f"Критична помилка: Не вдалося отримати User ID з валідним токеном: {info_msg}")
-                 return False, f"Не вдалося отримати User ID з валідним токеном: {info_msg}"
+        if not self.user_id:
+            info_ok, info_msg = await self._get_user_info()
+            if not info_ok:
+                self.authenticated = False
+                print(f"Критична помилка: Не вдалося отримати User ID з валідним токеном: {info_msg}")
+                return False, f"Не вдалося отримати User ID з валідним токеном: {info_msg}"
         else:
-             info_ok = True # ID вже є
+            info_ok = True
 
-        # Спробуємо визначити username з get_site_info (якщо можливо)
-        # Ця інформація не завжди є в get_site_info, але спробуємо
-        # success_site_info, site_info_data = await self._call_api("core_webservice_get_site_info")
-        # if success_site_info and isinstance(site_info_data, dict):
-        #      self.username = site_info_data.get("username", "N/A (Token Auth)")
+        success_site_info, site_info_data = await self._call_api("core_webservice_get_site_info")
+        if success_site_info and isinstance(site_info_data, dict):
+            self.username = site_info_data.get("username")
+            print(f"Ім'я користувача (з токена): {self.username}")
+        else:
+            self.username = "TokenUser"
 
-        print(f"User ID отримано: {self.user_id}")
         role_ok = await self._get_user_role()
         if role_ok:
             print(f"Роль користувача визначена. is_teacher: {self.is_teacher}")
         else:
             print("Попередження: Не вдалося визначити роль користувача.")
 
-        # Встановлюємо ім'я користувача (хоча воно не використовувалось для логіну)
-        # Можна отримати його з site_info, якщо функція повертає
-        # Або залишити як є / встановити маркер
-        success_site_info, site_info_data = await self._call_api("core_webservice_get_site_info")
-        if success_site_info and isinstance(site_info_data, dict):
-             self.username = site_info_data.get("username") # Moodle має повертати username тут
-             print(f"Ім'я користувача (з токена): {self.username}")
-        else:
-             self.username = "TokenUser" # Заглушка, якщо не вдалося отримати
-
+        self.authenticated = True
         return True, "Автентифікація за допомогою токена успішна"
 
+    async def update_user_info(self) -> Tuple[bool, str]:
+        """Оновлення інформації про користувача."""
+        if not self.token:
+            return False, "Токен відсутній"
+
+        if not self.authenticated:
+            # Спробуємо автентифікуватися
+            auth_success, auth_msg = await self.authenticate_with_token()
+            if not auth_success:
+                print(f"Не запускаємо update_user_info: {auth_msg}")
+                return False, f"Автентифікація не пройдена: {auth_msg}"
+
+        success, msg = await self._get_user_info()
+        if not success:
+            print(f"Помилка оновлення інформації користувача: {msg}")
+            return False, f"Помилка оновлення інформації: {msg}"
+
+        role_ok = await self._get_user_role()
+        if not role_ok:
+            print("Помилка оновлення ролі користувача")
+            return False, "Не вдалося оновити роль користувача"
+
+        print("Інформація користувача успішно оновлена")
+        return True, "Інформація користувача оновлена успішно"
 
     async def _call_api(self, function: str, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, Any]:
         """Виконання API запитів до Moodle."""
@@ -214,6 +229,13 @@ class MoodleAuth:
             print("User ID невідомий, неможливо перевірити права.")
             return False
 
+        # Спочатку перевіряємо примусове призначення ролі
+        force_teacher = os.getenv("FORCE_TEACHER_ROLE", "").lower() == "true"
+        if force_teacher:
+            self.is_teacher = True
+            print("УВАГА: Роль викладача встановлена примусово через FORCE_TEACHER_ROLE")
+            return True
+
         print(f"Отримання курсів для користувача ID: {self.user_id}")
         success, courses_data = await self._call_api("core_enrol_get_users_courses", {
             "userid": self.user_id
@@ -225,14 +247,12 @@ class MoodleAuth:
 
         # Перевірка через параметри курсів
         for course in courses_data:
-            # Спочатку перевіряємо роль у самих курсах, якщо є така інформація
             if 'roleid' in course and course['roleid'] in [3, 4]:  # 3 і 4 часто відповідають викладачам
                 self.is_teacher = True
                 print(f"Знайдено роль викладача в курсі ID {course.get('id')}")
                 return True
         
         # Якщо інформації про роль у курсі немає, спробуємо інший підхід
-        # Отримуємо ролі через розширене API
         try:
             for course_id in [course.get('id') for course in courses_data if course.get('id')]:
                 print(f"  Отримання ролей для курсу ID {course_id}...")
@@ -250,13 +270,6 @@ class MoodleAuth:
                                     return True
         except Exception as e:
             print(f"Помилка при перевірці ролей у курсі: {e}")
-        
-        # Якщо не вдалося визначити роль через API, спробуйте ручне призначення
-        force_teacher = os.getenv("FORCE_TEACHER_ROLE", "").lower() == "true"
-        if force_teacher:
-            self.is_teacher = True
-            print("УВАГА: Роль викладача встановлена примусово через FORCE_TEACHER_ROLE")
-            return True
             
         self.is_teacher = False
         print("Права викладача не знайдено в жодному з курсів.")

@@ -30,22 +30,29 @@ class TeacherDashboard:
     
     def __init__(self, moodle_url: str = "http://78.137.2.119:2929"):
         self.moodle_url = moodle_url
-        # Ініціалізуємо MoodleAuth. Токен має завантажитись з .env
         self.auth = MoodleAuth(moodle_url)
-        self.mcp_server = None  # Атрибут для MoodleMCPServer, якщо використовується
-        self.mcp_process = None
-        self.llm_provider = None
-        
-        # Режим роботи: "analytical" або "administrative"
-        self.mode = "analytical"
-        
-        # Стан дашборду
-        self.courses = []
         self.selected_course = None
-        self.selected_course_name = None
+        self.courses = []
         self.students = []
         self.assignments = []
-        self.chat_history = []
+        self.messages = []
+        self.llm_provider = None
+        self._initialize_auth()  # Викликаємо синхронно
+        
+    def _initialize_auth(self):
+        """Ініціалізація автентифікації"""
+        if self.auth.token:
+            print("Спроба автоматичної автентифікації...")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                success, message = loop.run_until_complete(self.auth.authenticate_with_token())
+                if success:
+                    print(f"Автентифікація успішна. User ID: {self.auth.user_id}, Is Teacher: {self.auth.is_teacher}")
+                else:
+                    print(f"Помилка автентифікації: {message}")
+            finally:
+                loop.close()
     
     def build_ui(self) -> gr.Blocks:
         """Побудова інтерфейсу панелі викладача."""
@@ -66,28 +73,33 @@ class TeacherDashboard:
                     # Блок інформації про користувача
                     with gr.Group() as user_info_group:
                         gr.Markdown("### Інформація про викладача")
-                        # Встановлюємо початкове значення "Завантаження..."
-                        user_info_output = gr.Textbox(label="Профіль", interactive=False, lines=6, value="Завантаження...")
-                        # Запускаємо асинхронне оновлення, якщо токен та ID існують.
-                        if self.auth.token and self.auth.user_id:
-                            print("Запуск task: update_user_info")
-                            asyncio.create_task(self.update_user_info(user_info_output))
+                        user_info_output = gr.Textbox(label="Профіль", interactive=False, lines=6)
+                        
+                        # Оновлюємо інформацію про користувача синхронно
+                        if self.auth.authenticated and self.auth.token and self.auth.user_id:
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                loop.run_until_complete(self.update_user_info(user_info_output))
+                            finally:
+                                loop.close()
                         else:
-                            # Якщо токена або ID немає на етапі build_ui
-                            auth_error_msg = "Помилка: Автентифікація не пройдена (перевірте токен/права)."
-                            user_info_output.value = auth_error_msg
-                            print(f"Не запускаємо update_user_info: {auth_error_msg}")
+                            user_info_output.value = "Очікування автентифікації..."
                     
                     # Блок курсів
                     with gr.Group() as courses_group:
                         gr.Markdown("### Мої курси")
                         refresh_courses_button = gr.Button("Оновити список курсів")
-                        # Встановлюємо початкове значення "Завантаження..."
                         courses_dropdown = gr.Dropdown(label="Виберіть курс", choices=[("Завантаження...", None)], interactive=False)
-                        # Запускаємо асинхронне оновлення, якщо токен та ID існують.
+                        
+                        # Завантажуємо курси синхронно
                         if self.auth.token and self.auth.user_id:
-                            print("Запуск task: load_courses")
-                            asyncio.create_task(self.load_courses(courses_dropdown))
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            try:
+                                loop.run_until_complete(self.load_courses(courses_dropdown))
+                            finally:
+                                loop.close()
                 
                 with gr.Column(scale=2):
                     with gr.Tabs() as tabs:
@@ -386,7 +398,7 @@ class TeacherDashboard:
         """Оновлення інформації про користувача."""
         if not self.auth.token or not self.auth.user_id:
             await asyncio.sleep(0)
-            info_output_component.update("Помилка: Не вдалося отримати інформацію (проблема автентифікації).")
+            info_output_component.value = "Помилка: Не вдалося отримати інформацію (проблема автентифікації)."
             return
         
         try:
@@ -406,7 +418,7 @@ class TeacherDashboard:
                     f"Email: {user.get('email', 'N/A')}",
                     f"Є викладачем: {'Так' if self.auth.is_teacher else 'Ні (або не визначено)'}"
                 ]
-                info_output_component.update("\n".join(info))
+                info_output_component.value = "\n".join(info)
                 print("Інформація про користувача оновлена.")
             else:
                 error_msg = f"Не вдалося отримати дані користувача: {data if not success else 'Порожня відповідь'}"
@@ -1417,7 +1429,7 @@ class TeacherDashboard:
     async def send_message(self, message: str) -> Tuple[List[Tuple[str, str]], str]:
         """Відправка повідомлення до LLM та отримання відповіді."""
         if not message:
-            return self.chat_history, ""
+            return self.messages, ""
         
         if not self.llm_provider:
             try:
@@ -1425,16 +1437,17 @@ class TeacherDashboard:
                 self.llm_provider = await LLMProviderFactory.create_provider("claude")
                 
                 if not self.llm_provider:
-                    self.chat_history.append((message, "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."))
-                    return self.chat_history, ""
+                    self.messages.append((message, "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."))
+                    return self.messages, ""
             except Exception as e:
                 error_msg = f"Помилка ініціалізації LLM провайдера: {e}"
                 print(error_msg)
-                self.chat_history.append((message, f"Помилка ініціалізації LLM провайдера: {e}. Будь ласка, спочатку ініціалізуйте провайдера."))
-                return self.chat_history, ""
+                self.messages.append((message, f"Помилка ініціалізації LLM провайдера: {e}. Будь ласка, спочатку ініціалізуйте провайдера."))
+                return self.messages, ""
         
         # Підготовка контексту
         context = {
+            "user_id": self.auth.user_id,
             "user_role": "teacher",
             "mode": self.mode,
             "system_prompt": "Ви корисний асистент для викладача навчальної платформи Moodle. " +
@@ -1445,53 +1458,50 @@ class TeacherDashboard:
         }
         
         if self.selected_course:
-            context["course"] = self.selected_course_name or f"Курс ID: {self.selected_course}"
+            # Отримання повної інформації про курс
+            course_info = await self.get_course_info()
+            context["course"] = {
+                "id": self.selected_course,
+                "name": self.selected_course_name,
+                "info": course_info
+            }
             
-            # Додаємо дані про студентів (обмежуємо для запобігання перевищення контексту)
-            if self.students:
-                # Обмежуємо до 100 студентів для запобігання перевищення контексту
-                max_students = min(len(self.students), 100)
-                students_data = []
-                for i in range(max_students):
-                    student = self.students[i]
-                    students_data.append({
-                        "id": student.get('id', 'N/A'),
-                        "name": student.get('fullname', 'N/A'),
-                        "email": student.get('email', 'N/A')
-                    })
-                context["students"] = students_data
-                context["student_count"] = len(self.students)
+            # Отримання повної інформації про студентів
+            students_data = await self.get_course_students()
+            if students_data and "students" in students_data:
+                # Обмежуємо до 50 студентів для запобігання перевищення контексту
+                max_students = min(len(students_data["students"]), 50)
+                context["students"] = students_data["students"][:max_students]
+                context["student_count"] = len(students_data["students"])
             
-            # Додаємо дані про завдання
-            if self.assignments:
-                assignments_data = []
-                for assignment in self.assignments:
-                    assignments_data.append({
-                        "id": assignment.get('id', 'N/A'),
-                        "name": assignment.get('name', 'Без назви'),
-                        "duedate": assignment.get('duedate', 'Не встановлено'),
-                        "submissions": assignment.get('submissions', 0)
-                    })
-                context["assignments"] = assignments_data
+            # Отримання інформації про завдання
+            assignments_data = await self.get_course_assignments()
+            if assignments_data and "assignments" in assignments_data:
+                context["assignments"] = assignments_data["assignments"]
+            
+            # Отримання статистики оцінок
+            grades_stats = await self.get_grades_statistics()
+            if grades_stats:
+                context["grades_statistics"] = grades_stats
         
         try:
             # Додаємо до історії перед отриманням відповіді, щоб показати повідомлення одразу
-            self.chat_history.append((message, None))
+            self.messages.append((message, None))
             
             # Отримання відповіді від LLM
             response = await self.llm_provider.generate_response(message, context)
             
             # Оновлення останнього повідомлення в історії з відповіддю
-            self.chat_history[-1] = (message, response)
+            self.messages[-1] = (message, response)
             
-            return self.chat_history, ""
+            return self.messages, ""
         except Exception as e:
             error_msg = f"Помилка отримання відповіді: {e}"
             print(error_msg)
             import traceback
             traceback.print_exc()
-            self.chat_history[-1] = (message, error_msg)
-            return self.chat_history, ""
+            self.messages[-1] = (message, error_msg)
+            return self.messages, ""
     
     def _get_current_datetime(self) -> str:
         """Отримання поточної дати і часу в читабельному форматі."""

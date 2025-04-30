@@ -9,6 +9,9 @@ import os
 import asyncio
 from abc import ABC, abstractmethod
 
+MAX_PROMPT_LENGTH = 10000
+MAX_CONTEXT_SIZE = 100000
+
 class LLMProvider(ABC):
     """Базовий клас для всіх LLM провайдерів."""
     
@@ -33,6 +36,7 @@ class ClaudeProvider(LLMProvider):
         self.model = model
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         self.api_url = "https://api.anthropic.com/v1/messages"
+        self.cache = {}  # Простий кеш відповідей
         
         if not self.api_key:
             print("УВАГА: Змінна оточення ANTHROPIC_API_KEY не знайдена")
@@ -41,10 +45,60 @@ class ClaudeProvider(LLMProvider):
         """Перевірка доступності API ключа Claude."""
         return self.api_key is not None
     
+    async def validate_mcp_access(self, context: Dict[str, Any]) -> bool:
+        """Перевірка прав доступу через MCP сервер"""
+        if not context:
+            return False
+            
+        # Перевірка необхідних полів у контексті
+        required_fields = ["user_role"]
+        if not all(field in context for field in required_fields):
+            print("Помилка: Відсутні обов'язкові поля в контексті")
+            return False
+            
+        # Перевірка доступу до даних курсу
+        if "course" in context:
+            try:
+                # Якщо є інформація про курс, вважаємо що доступ дозволено
+                return True
+            except Exception as e:
+                print(f"Помилка перевірки доступу до курсу: {e}")
+                return False
+        
+        return True  # Якщо немає специфічних перевірок, дозволяємо доступ
+    
+    async def validate_context(self, context: Dict[str, Any]) -> bool:
+        """Валідація даних в контексті"""
+        required_fields = ["user_id", "user_role"]
+        if not all(field in context for field in required_fields):
+            return False
+        
+        # Додаткові перевірки специфічних полів
+        if "course" in context:
+            if not isinstance(context["course"], dict):
+                return False
+        return True
+    
+    async def get_cached_response(self, prompt: str, context: Dict[str, Any]) -> Optional[str]:
+        cache_key = f"{prompt}:{json.dumps(context)}"
+        return self.cache.get(cache_key)
+    
     async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Генерація відповіді з використанням API Claude."""
+        # Додати логування
+        print(f"Генерація відповіді для користувача {context.get('user_id')} в режимі {context.get('mode')}")
         if not self.api_key:
             return "Помилка: API ключ для Claude не налаштовано. Додайте ANTHROPIC_API_KEY у файл .env."
+        
+        # Спочатку перевіряємо доступ
+        if context and not await self.validate_mcp_access(context):
+            return "Помилка: Немає прав доступу до даних через MCP сервер"
+        
+        if len(prompt) > MAX_PROMPT_LENGTH:
+            return "Помилка: Занадто довгий запит"
+        
+        if context and len(json.dumps(context)) > MAX_CONTEXT_SIZE:
+            return "Помилка: Занадто великий контекст"
         
         headers = {
             "x-api-key": self.api_key,
@@ -53,7 +107,10 @@ class ClaudeProvider(LLMProvider):
         }
         
         # Підготовка системного промпту на основі контексту
-        system_prompt = "Ви корисний асистент для навчальної платформи Moodle. Відповідайте українською мовою, якщо явно не зазначено інше."
+        system_prompt = """Ви корисний асистент для навчальної платформи Moodle. 
+        Ти отримуєш інформацію про навчальні дисципліни та активність студентів через MCP сервер.
+        Не використовуй жодних інших джерел для відповіді.
+        Відповідайте українською мовою, якщо явно не зазначено інше."""
         
         if context:
             if "system_prompt" in context:
@@ -79,7 +136,7 @@ class ClaudeProvider(LLMProvider):
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "system": system_prompt,
-            "max_tokens": 4000
+            "max_tokens": 8000
         }
         
         try:
