@@ -1507,6 +1507,22 @@ class TeacherDashboard:
             # Тимчасове повідомлення
             self.messages.append((message, "Очікування відповіді..."))
             
+            # Формування повідомлень з історії для Claude
+            messages = []
+            # Беремо останні N повідомлень для контексту, пропускаючи поточне тимчасове
+            for idx, (user_msg, assistant_msg) in enumerate(self.messages[:-1]):
+                if len(self.messages) - idx <= self.MAX_CONTEXT_MESSAGES:
+                    if user_msg and user_msg.strip():
+                        messages.append({"role": "user", "content": user_msg})
+                    if assistant_msg and assistant_msg.strip() and assistant_msg != "Очікування відповіді...":
+                        messages.append({"role": "assistant", "content": assistant_msg})
+            
+            # Додаємо поточне повідомлення
+            messages.append({"role": "user", "content": message})
+            
+            # Додаємо історію в контекст ПЕРЕД викликом generate_response
+            context["messages"] = messages
+            
             # Отримання відповіді - використовуємо тільки прямий доступ 
             response = await self.llm_provider.generate_response(
                 message, 
@@ -1520,6 +1536,10 @@ class TeacherDashboard:
             # Оновлення повідомлення
             if self.messages:
                 self.messages[-1] = (message, response)
+            
+            # Обмеження довжини історії чату
+            if len(self.messages) > self.MAX_HISTORY_LENGTH:
+                self.messages = self.messages[-self.MAX_HISTORY_LENGTH:]
             
             return self.messages, ""
         except Exception as e:
