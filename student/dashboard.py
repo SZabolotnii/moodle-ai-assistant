@@ -2,6 +2,7 @@ import gradio as gr
 import asyncio
 import os
 import sys
+import json
 from typing import Dict, Any, List, Tuple, Optional
 
 # Імпортуємо необхідні модулі з проекту
@@ -30,6 +31,10 @@ class StudentDashboard:
         self.selected_course_name = None
         self.assignments = []
         self.chat_history = []
+        
+        # Константи для обмеження історії чату
+        self.MAX_HISTORY_LENGTH = 50  # Максимальна кількість повідомлень у історії
+        self.MAX_CONTEXT_MESSAGES = 10  # Максимальна кількість повідомлень для контексту LLM
     
     def build_ui(self) -> gr.Blocks:
         """Побудова інтерфейсу панелі студента."""
@@ -99,6 +104,9 @@ class StudentDashboard:
                                 chat_input = gr.Textbox(label="Задайте питання", lines=2, placeholder="Наприклад: поясни мені тему цього курсу")
                                 send_button = gr.Button("Відправити")
                             
+                            # Очищення історії чату
+                            clear_chat_button = gr.Button("Очистити історію")
+                            
                             # Вибір провайдера
                             with gr.Accordion("Налаштування AI", open=False):
                                 provider_dropdown = gr.Dropdown(
@@ -157,6 +165,12 @@ class StudentDashboard:
                 fn=self.send_message,
                 inputs=[chat_input],
                 outputs=[chat_history_output, chat_input]
+            )
+            
+            clear_chat_button.click(
+                fn=self.clear_chat_history,
+                inputs=[],
+                outputs=[chat_history_output]
             )
         
         return dashboard
@@ -505,18 +519,26 @@ class StudentDashboard:
             traceback.print_exc()
             return error_msg
     
+    def clear_chat_history(self) -> List[Tuple[str, str]]:
+        """Очищення історії чату."""
+        self.chat_history = []
+        return self.chat_history
+    
     async def send_message(self, message: str) -> Tuple[List[Tuple[str, str]], str]:
         """Відправка повідомлення до LLM та отримання відповіді."""
-        if not message:
+        if not message or message.strip() == "":
             return self.chat_history, ""
         
+        # Автоматична ініціалізація LLM провайдера, якщо потрібно
         if not self.llm_provider:
             try:
                 print("Автоматична ініціалізація LLM провайдера (Claude)")
                 self.llm_provider = await LLMProviderFactory.create_provider("claude")
                 
                 if not self.llm_provider:
-                    self.chat_history.append((message, "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."))
+                    error_msg = "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."
+                    print(error_msg)
+                    self.chat_history.append((message, error_msg))
                     return self.chat_history, ""
             except Exception as e:
                 error_msg = f"Помилка ініціалізації LLM провайдера: {e}"
@@ -570,14 +592,50 @@ class StudentDashboard:
                 print(f"Помилка отримання вмісту курсу: {e}")
         
         try:
-            # Додаємо до історії перед отриманням відповіді, щоб показати повідомлення одразу
-            self.chat_history.append((message, None))
+            # Додаємо до історії перед отриманням відповіді з тимчасовим повідомленням
+            tmp_msg = "Очікування відповіді..."
+            self.chat_history.append((message, tmp_msg))
             
-            # Отримання відповіді від LLM
-            response = await self.llm_provider.generate_response(message, context)
+            # Формування повідомлень з історії для Claude
+            messages = []
+            # Беремо останні повідомлення для контексту, пропускаючи поточне тимчасове
+            for idx, (user_msg, assistant_msg) in enumerate(self.chat_history[:-1]):
+                if len(self.chat_history) - idx <= self.MAX_CONTEXT_MESSAGES:
+                    if user_msg and user_msg.strip():
+                        messages.append({"role": "user", "content": user_msg})
+                    if assistant_msg and assistant_msg.strip() and assistant_msg != tmp_msg:
+                        messages.append({"role": "assistant", "content": assistant_msg})
+            
+            # Додавання поточного повідомлення
+            messages.append({"role": "user", "content": message})
+            
+            # Додавання історії чату до контексту
+            context["messages"] = messages
+            context["chat_history"] = messages  # Дублюємо для сумісності
+            
+            # Додавання MCP параметрів для використання MCP функцій
+            context["use_mcp"] = True
+            context["mcp_server_url"] = self.moodle_url
+            context["mcp_token"] = self.auth.token
+            
+            # Отримання відповіді від LLM з використанням історії
+            print(f"Відправка запиту до Claude з {len(messages)} повідомленнями в історії")
+            
+            response = await self.llm_provider.generate_response(
+                message, 
+                context,
+                use_mcp=True,  # Дозволяємо використання MCP
+                mcp_server_url=self.moodle_url,
+                mcp_token=self.auth.token
+            )
             
             # Оновлення останнього повідомлення в історії з відповіддю
-            self.chat_history[-1] = (message, response)
+            if self.chat_history:
+                self.chat_history[-1] = (message, response)
+            
+            # Обмеження довжини історії чату
+            if len(self.chat_history) > self.MAX_HISTORY_LENGTH:
+                self.chat_history = self.chat_history[-self.MAX_HISTORY_LENGTH:]
             
             return self.chat_history, ""
         except Exception as e:
@@ -585,7 +643,13 @@ class StudentDashboard:
             print(error_msg)
             import traceback
             traceback.print_exc()
-            self.chat_history[-1] = (message, error_msg)
+            
+            # Оновлення останнього повідомлення з повідомленням про помилку
+            if self.chat_history and self.chat_history[-1][0] == message:
+                self.chat_history[-1] = (message, error_msg)
+            else:
+                self.chat_history.append((message, error_msg))
+            
             return self.chat_history, ""
     
     def _format_timestamp(self, timestamp: Optional[int]) -> str:

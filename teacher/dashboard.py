@@ -39,7 +39,10 @@ class TeacherDashboard:
         self.llm_provider = None
         self.mode = "analytical"  # Додаємо ініціалізацію режиму
         self._initialize_auth()  # Викликаємо синхронно
+        self.MAX_HISTORY_LENGTH = 50  # Максимальна кількість повідомлень у історії
+        self.MAX_CONTEXT_MESSAGES = 10  # Максимальна кількість повідомлень для контексту LLM
         
+    
     def _initialize_auth(self):
         """Ініціалізація автентифікації"""
         if self.auth.token:
@@ -353,6 +356,15 @@ class TeacherDashboard:
                 outputs=[chat_history_output, chat_input]
             )
             
+            clear_chat_button = gr.Button("Очистити історію")
+
+            # Додати обробник до списку обробників:
+            clear_chat_button.click(
+                fn=self.clear_chat_history,
+                inputs=[],
+                outputs=[chat_history_output]
+            )
+
             # Обробники для MCP сервера
             if MoodleMCPServer is not None:
                 start_mcp_button.click(
@@ -1429,16 +1441,19 @@ class TeacherDashboard:
     
     async def send_message(self, message: str) -> Tuple[List[Tuple[str, str]], str]:
         """Відправка повідомлення до LLM та отримання відповіді."""
-        if not message:
+        if not message or message.strip() == "":
             return self.messages, ""
         
+        # Автоматична ініціалізація LLM провайдера, якщо потрібно
         if not self.llm_provider:
             try:
                 print("Автоматична ініціалізація LLM провайдера (Claude)")
                 self.llm_provider = await LLMProviderFactory.create_provider("claude")
                 
                 if not self.llm_provider:
-                    self.messages.append((message, "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."))
+                    error_msg = "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."
+                    print(error_msg)
+                    self.messages.append((message, error_msg))
                     return self.messages, ""
             except Exception as e:
                 error_msg = f"Помилка ініціалізації LLM провайдера: {e}"
@@ -1446,13 +1461,11 @@ class TeacherDashboard:
                 self.messages.append((message, f"Помилка ініціалізації LLM провайдера: {e}. Будь ласка, спочатку ініціалізуйте провайдера."))
                 return self.messages, ""
         
-        # Підготовка базового контексту
+        # Підготовка контексту
         context = {
             "user_id": self.auth.user_id,
             "user_role": "teacher",
             "mode": self.mode,
-            "selected_course": self.selected_course,
-            "selected_course_name": self.selected_course_name,
             "system_prompt": "Ви корисний асистент для викладача навчальної платформи Moodle. " +
                             f"Ви працюєте в режимі '{self.mode}'. " +
                             "У вас є доступ до даних Moodle через MCP сервер. " +
@@ -1467,9 +1480,34 @@ class TeacherDashboard:
                             "Відповідайте українською мовою, якщо явно не зазначено інше."
         }
         
+        # Додавання інформації про курс, якщо вибрано
+        if self.selected_course:
+            context["selected_course"] = self.selected_course
+            context["selected_course_name"] = self.selected_course_name
+        
         try:
-            # Додаємо до історії перед отриманням відповіді
-            self.messages.append((message, None))
+            # Додаємо тимчасове повідомлення до історії
+            tmp_msg = "Очікування відповіді..."
+            self.messages.append((message, tmp_msg))
+            
+            # Формування повідомлень з історії для Claude
+            messages = []
+            # Берем останні N повідомлень для контексту
+            for idx, (user_msg, assistant_msg) in enumerate(self.messages[:-1]):
+                if len(self.messages) - idx <= self.MAX_CONTEXT_MESSAGES:
+                    if user_msg and user_msg.strip():
+                        messages.append({"role": "user", "content": user_msg})
+                    if assistant_msg and assistant_msg.strip() and assistant_msg != tmp_msg:
+                        messages.append({"role": "assistant", "content": assistant_msg})
+            
+            # Додавання поточного повідомлення
+            messages.append({"role": "user", "content": message})
+            
+            # Додавання історії чату до контексту
+            context["messages"] = messages
+            context["chat_history"] = messages  # Дублюємо для сумісності
+            
+            print(f"Відправка запиту до Claude з {len(messages)} повідомленнями в історії")
             
             # Отримання відповіді від LLM з можливістю використання MCP
             response = await self.llm_provider.generate_response(
@@ -1481,7 +1519,12 @@ class TeacherDashboard:
             )
             
             # Оновлення останнього повідомлення в історії з відповіддю
-            self.messages[-1] = (message, response)
+            if self.messages:
+                self.messages[-1] = (message, response)
+            
+            # Обмеження довжини історії чату
+            if len(self.messages) > self.MAX_HISTORY_LENGTH:
+                self.messages = self.messages[-self.MAX_HISTORY_LENGTH:]
             
             return self.messages, ""
         except Exception as e:
@@ -1489,8 +1532,19 @@ class TeacherDashboard:
             print(error_msg)
             import traceback
             traceback.print_exc()
-            self.messages[-1] = (message, error_msg)
+            
+            # Оновлення останнього повідомлення з помилкою
+            if self.messages and self.messages[-1][0] == message:
+                self.messages[-1] = (message, error_msg)
+            else:
+                self.messages.append((message, error_msg))
+            
             return self.messages, ""
+    
+    def clear_chat_history(self) -> List[Tuple[str, str]]:
+        """Очищення історії чату."""
+        self.messages = []
+        return []
     
     def _get_current_datetime(self) -> str:
         """Отримання поточної дати і часу в читабельному форматі."""

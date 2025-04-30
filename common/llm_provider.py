@@ -44,55 +44,96 @@ class ClaudeProvider(LLMProvider):
     async def is_available(self) -> bool:
         """Перевірка доступності API ключа Claude."""
         return self.api_key is not None
-    
-    async def validate_mcp_access(self, context: Dict[str, Any]) -> bool:
-        """Перевірка прав доступу через MCP сервер"""
-        if not context:
-            return False
-            
-        # Перевірка необхідних полів у контексті
-        required_fields = ["user_role", "mcp_server_url", "mcp_token"]
-        if not all(field in context for field in required_fields):
-            print("Помилка: Відсутні обов'язкові поля в контексті для MCP")
-            return False
-            
-        return True
-    
-    async def validate_context(self, context: Dict[str, Any]) -> bool:
-        """Валідація даних в контексті"""
-        required_fields = ["user_id", "user_role"]
-        if not all(field in context for field in required_fields):
-            return False
-        
-        # Додаткові перевірки для MCP
-        if context.get("use_mcp", False):
-            if not all(field in context for field in ["mcp_server_url", "mcp_token"]):
-                return False
-        
-        return True
-    
-    async def get_cached_response(self, prompt: str, context: Dict[str, Any]) -> Optional[str]:
-        cache_key = f"{prompt}:{json.dumps(context)}"
-        return self.cache.get(cache_key)
-    
-    async def _call_mcp_api(self, function: str, params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
-        """Виклик API через MCP сервер"""
+
+    async def _call_mcp_api(self, function: str, params: Dict[str, Any], mcp_server_url: str, mcp_token: str) -> Dict[str, Any]:
+        """Виклик API Moodle через MCP сервер."""
         try:
+            print(f"Виклик Moodle API через MCP: {function} з параметрами {params}")
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
-                    f"{context['mcp_server_url']}/webservice/rest/server.php",
+                    f"{mcp_server_url}/webservice/rest/server.php",
                     params={
-                        "wstoken": context["mcp_token"],
+                        "wstoken": mcp_token,
                         "wsfunction": function,
                         "moodlewsrestformat": "json",
                         **params
                     }
                 )
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+                
+                # Перевірка на помилки у відповіді Moodle
+                if isinstance(data, dict) and "exception" in data:
+                    print(f"Помилка Moodle API: {data.get('message', 'Невідома помилка')}")
+                    return {"error": data.get('message', 'Невідома помилка Moodle API')}
+                
+                print(f"Успішна відповідь від MCP API {function}")
+                return data
         except Exception as e:
-            print(f"Помилка виклику MCP API: {e}")
+            print(f"Помилка виклику MCP API {function}: {e}")
             return {"error": str(e)}
+            
+    async def _prepare_mcp_context(self, context: Dict[str, Any], mcp_server_url: str, mcp_token: str) -> str:
+        """Підготовка контексту з даними з MCP."""
+        # Додаємо в контекст дані про студентів, оцінки і завдання з MCP
+        mcp_data = {}
+        
+        try:
+            # Якщо вибрано курс, отримуємо студентів
+            if "selected_course" in context or "course" in context:
+                course_id = context.get("selected_course") or context.get("course", {}).get("id")
+                if course_id:
+                    # Отримання студентів курсу
+                    students_data = await self._call_mcp_api("core_enrol_get_enrolled_users", 
+                                                            {"courseid": course_id}, 
+                                                            mcp_server_url, mcp_token)
+                    if not isinstance(students_data, dict) or "error" not in students_data:
+                        # Фільтруємо тільки студентів
+                        students = [user for user in students_data if any(role.get('shortname') == 'student' for role in user.get('roles', []))]
+                        mcp_data["students"] = students
+                        print(f"Отримано {len(students)} студентів через MCP для курсу {course_id}")
+                    
+                    # Отримання завдань курсу
+                    assignments_data = await self._call_mcp_api("mod_assign_get_assignments", 
+                                                               {"courseids[0]": course_id}, 
+                                                               mcp_server_url, mcp_token)
+                    if not isinstance(assignments_data, dict) or "error" not in assignments_data:
+                        if "courses" in assignments_data:
+                            for course in assignments_data["courses"]:
+                                if str(course.get('id')) == str(course_id):
+                                    mcp_data["assignments"] = course.get("assignments", [])
+                                    print(f"Отримано {len(mcp_data.get('assignments', []))} завдань через MCP")
+        except Exception as e:
+            print(f"Помилка при підготовці MCP контексту: {e}")
+        
+        # Повертаємо форматований контекст для додавання до системного промпту
+        if mcp_data:
+            mcp_context = "# Дані з Moodle, отримані через MCP:\n\n"
+            
+            # Додаємо дані про студентів
+            if "students" in mcp_data and mcp_data["students"]:
+                mcp_context += "## Студенти курсу:\n"
+                for i, student in enumerate(mcp_data["students"][:20]):  # Обмежуємо до 20 студентів
+                    mcp_context += f"{i+1}. {student.get('fullname', 'Невідомо')} (ID: {student.get('id', 'N/A')}, Email: {student.get('email', 'N/A')})\n"
+                if len(mcp_data["students"]) > 20:
+                    mcp_context += f"...та ще {len(mcp_data['students']) - 20} студентів.\n"
+                mcp_context += f"\nВсього студентів: {len(mcp_data['students'])}\n\n"
+            
+            # Додаємо дані про завдання
+            if "assignments" in mcp_data and mcp_data["assignments"]:
+                mcp_context += "## Завдання курсу:\n"
+                for i, assignment in enumerate(mcp_data["assignments"]):
+                    due_date = "Не встановлено"
+                    if assignment.get("duedate") and assignment["duedate"] > 0:
+                        from datetime import datetime
+                        due_date = datetime.fromtimestamp(assignment["duedate"]).strftime('%d.%m.%Y %H:%M')
+                    
+                    mcp_context += f"{i+1}. {assignment.get('name', 'Без назви')} (ID: {assignment.get('id', 'N/A')}, Термін: {due_date})\n"
+                mcp_context += f"\nВсього завдань: {len(mcp_data['assignments'])}\n\n"
+            
+            return mcp_context
+        
+        return ""
     
     async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None, use_mcp: bool = False, mcp_server_url: Optional[str] = None, mcp_token: Optional[str] = None) -> str:
         """Генерація відповіді з використанням API Claude."""
@@ -100,25 +141,11 @@ class ClaudeProvider(LLMProvider):
         if not self.api_key:
             return "Помилка: API ключ для Claude не налаштовано. Додайте ANTHROPIC_API_KEY у файл .env."
         
-        # Валідація контексту
-        if context and not await self.validate_context(context):
-            return "Помилка: Некоректний контекст"
-        
         if len(prompt) > MAX_PROMPT_LENGTH:
             return "Помилка: Занадто довгий запит"
         
         if context and len(json.dumps(context)) > MAX_CONTEXT_SIZE:
             return "Помилка: Занадто великий контекст"
-        
-        # Додавання MCP параметрів до контексту
-        if use_mcp and mcp_server_url and mcp_token:
-            if not context:
-                context = {}
-            context.update({
-                "use_mcp": True,
-                "mcp_server_url": mcp_server_url,
-                "mcp_token": mcp_token
-            })
         
         # Підготовка системного промпту
         system_prompt = """Ви корисний асистент для навчальної платформи Moodle. 
@@ -133,11 +160,28 @@ class ClaudeProvider(LLMProvider):
         7. core_user_get_users_by_field - отримання інформації про користувачів
         
         Не використовуй жодних інших джерел для відповіді.
-        Відповідайте українською мовою, якщо явно не зазначено інше."""
+        Відповідайте українською мовою, якщо явно не зазначено інше.
+        
+        ВАЖЛИВО: МИ ВЖЕ ОТРИМАЛИ ДЛЯ ТЕБЕ НЕОБХІДНІ ДАНІ З MOODLE. ТОБІ НЕ ПОТРІБНО ВИКЛИКАТИ API НАПРЯМУ.
+        НЕ ПИШИ ВИГАДАНИЙ КОД ДЛЯ ВИКЛИКУ API. ВИКОРИСТОВУЙ ЛИШЕ ДАНІ, ЯКІ МИ НАДАЛИ ТОБІ В КОНТЕКСТІ.
+        """
+        
+        # Отримуємо дані з MCP, якщо це потрібно
+        mcp_context = ""
+        if use_mcp and mcp_server_url and mcp_token:
+            try:
+                mcp_context = await self._prepare_mcp_context(context, mcp_server_url, mcp_token)
+                if mcp_context:
+                    system_prompt += "\n\n" + mcp_context
+            except Exception as e:
+                print(f"Помилка при отриманні даних через MCP: {e}")
         
         if context:
             if "system_prompt" in context:
-                system_prompt = context["system_prompt"]
+                # Додаємо базовий системний промпт, потім додаємо користувацький
+                base_system = system_prompt
+                user_system = context["system_prompt"]
+                system_prompt = f"{base_system}\n\n{user_system}"
             
             # Додавання базової інформації про користувача та курс
             context_text = []
@@ -153,6 +197,14 @@ class ClaudeProvider(LLMProvider):
             if context_text:
                 system_prompt += "\n\n" + "\n".join(context_text)
         
+        # Підготовка повідомлень з історії чату (якщо є)
+        messages = []
+        if context and "messages" in context and isinstance(context["messages"], list):
+            messages = context["messages"]
+        elif messages == [] and prompt:
+            # Якщо немає історії, створюємо одне повідомлення
+            messages = [{"role": "user", "content": prompt}]
+            
         # Підготовка запиту до Claude
         headers = {
             "x-api-key": self.api_key,
@@ -162,12 +214,13 @@ class ClaudeProvider(LLMProvider):
         
         data = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "system": system_prompt,
             "max_tokens": 8000
         }
         
         try:
+            print(f"Відправка запиту до Claude API, модель: {self.model}")
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     self.api_url,
