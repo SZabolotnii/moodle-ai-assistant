@@ -37,6 +37,7 @@ class TeacherDashboard:
         self.assignments = []
         self.messages = []
         self.llm_provider = None
+        self.mode = "analytical"  # Додаємо ініціалізацію режиму
         self._initialize_auth()  # Викликаємо синхронно
         
     def _initialize_auth(self):
