@@ -35,10 +35,12 @@ class TeacherDashboard:
         self.courses = []
         self.students = []
         self.assignments = []
-        self.messages = []
+        self.messages = []  # Існуючий код
+        self.chat_history = self.messages  # Додати цей рядок для сумісності
         self.llm_provider = None
         self.mode = "analytical"  # Додаємо ініціалізацію режиму
         self._initialize_auth()  # Викликаємо синхронно
+        self.use_full_mcp_server = False  # За замовчуванням використовуємо прямий доступ
         self.MAX_HISTORY_LENGTH = 50  # Максимальна кількість повідомлень у історії
         self.MAX_CONTEXT_MESSAGES = 10  # Максимальна кількість повідомлень для контексту LLM
         
@@ -209,6 +211,22 @@ class TeacherDashboard:
                             
                             # Історія чату
                             chat_history_output = gr.Chatbot(label="Історія чату", height=400)
+                            
+                            # Вибір режиму інтеграції з MCP
+                            with gr.Row():
+                                gr.Markdown("#### Режим інтеграції з даними:")
+                                mcp_mode_selector = gr.Radio(
+                                    choices=["Прямий доступ до Moodle API", "Повний MCP сервер"],
+                                    value="Прямий доступ до Moodle API",
+                                    label="Режим взаємодії з Moodle",
+                                    info="Оберіть, як AI Асистент отримує дані з Moodle"
+                                )
+                                mcp_status = gr.Textbox(label="Статус MCP сервера", interactive=False)
+
+                            # Кнопки керування MCP сервером, видимі тільки в режимі повного MCP сервера
+                            with gr.Row(visible=False) as mcp_controls:
+                                start_mcp_button = gr.Button("Запустити MCP сервер")
+                                stop_mcp_button = gr.Button("Зупинити MCP сервер")
                             
                             # Введення та відправка
                             with gr.Row():
@@ -382,6 +400,24 @@ class TeacherDashboard:
                 update_mcp_config_button.click(
                     fn=lambda c: self.update_mcp_config(c),
                     inputs=[mcp_config],
+                    outputs=[mcp_status]
+                )
+
+                mcp_mode_selector.change(
+                    fn=self.switch_mcp_mode,
+                    inputs=[mcp_mode_selector],
+                    outputs=[mcp_controls, mcp_status]
+                )
+
+                start_mcp_button.click(
+                    fn=self.start_mcp_server,
+                    inputs=[],
+                    outputs=[mcp_status]
+                )
+
+                stop_mcp_button.click(
+                    fn=self.stop_mcp_server,
+                    inputs=[],
                     outputs=[mcp_status]
                 )
         
@@ -1444,21 +1480,18 @@ class TeacherDashboard:
         if not message or message.strip() == "":
             return self.messages, ""
         
-        # Автоматична ініціалізація LLM провайдера, якщо потрібно
+        # Автоматична ініціалізація LLM провайдера
         if not self.llm_provider:
             try:
                 print("Автоматична ініціалізація LLM провайдера (Claude)")
                 self.llm_provider = await LLMProviderFactory.create_provider("claude")
-                
                 if not self.llm_provider:
-                    error_msg = "Помилка: Не вдалося ініціалізувати LLM провайдера. Перевірте налаштування API ключа."
-                    print(error_msg)
+                    error_msg = "Помилка: Не вдалося ініціалізувати LLM провайдера."
                     self.messages.append((message, error_msg))
                     return self.messages, ""
             except Exception as e:
                 error_msg = f"Помилка ініціалізації LLM провайдера: {e}"
-                print(error_msg)
-                self.messages.append((message, f"Помилка ініціалізації LLM провайдера: {e}. Будь ласка, спочатку ініціалізуйте провайдера."))
+                self.messages.append((message, error_msg))
                 return self.messages, ""
         
         # Підготовка контексту
@@ -1466,81 +1499,40 @@ class TeacherDashboard:
             "user_id": self.auth.user_id,
             "user_role": "teacher",
             "mode": self.mode,
-            "system_prompt": "Ви корисний асистент для викладача навчальної платформи Moodle. " +
-                            f"Ви працюєте в режимі '{self.mode}'. " +
-                            "У вас є доступ до даних Moodle через MCP сервер. " +
-                            "Для отримання даних використовуйте наступні інструменти:\n" +
-                            "1. core_course_get_courses - отримання інформації про курси\n" +
-                            "2. core_course_get_contents - отримання вмісту курсу\n" +
-                            "3. core_enrol_get_enrolled_users - отримання списку студентів\n" +
-                            "4. mod_assign_get_assignments - отримання завдань\n" +
-                            "5. mod_assign_get_submissions - отримання зданих робіт\n" +
-                            "6. gradereport_user_get_grade_items - отримання оцінок\n" +
-                            "7. core_user_get_users_by_field - отримання інформації про користувачів\n" +
-                            "Відповідайте українською мовою, якщо явно не зазначено інше."
+            "selected_course": self.selected_course,
+            "selected_course_name": self.selected_course_name
         }
         
-        # Додавання інформації про курс, якщо вибрано
-        if self.selected_course:
-            context["selected_course"] = self.selected_course
-            context["selected_course_name"] = self.selected_course_name
-        
         try:
-            # Додаємо тимчасове повідомлення до історії
-            tmp_msg = "Очікування відповіді..."
-            self.messages.append((message, tmp_msg))
+            # Тимчасове повідомлення
+            self.messages.append((message, "Очікування відповіді..."))
             
-            # Формування повідомлень з історії для Claude
-            messages = []
-            # Берем останні N повідомлень для контексту
-            for idx, (user_msg, assistant_msg) in enumerate(self.messages[:-1]):
-                if len(self.messages) - idx <= self.MAX_CONTEXT_MESSAGES:
-                    if user_msg and user_msg.strip():
-                        messages.append({"role": "user", "content": user_msg})
-                    if assistant_msg and assistant_msg.strip() and assistant_msg != tmp_msg:
-                        messages.append({"role": "assistant", "content": assistant_msg})
-            
-            # Додавання поточного повідомлення
-            messages.append({"role": "user", "content": message})
-            
-            # Додавання історії чату до контексту
-            context["messages"] = messages
-            context["chat_history"] = messages  # Дублюємо для сумісності
-            
-            print(f"Відправка запиту до Claude з {len(messages)} повідомленнями в історії")
-            
-            # Отримання відповіді від LLM з можливістю використання MCP
+            # Отримання відповіді - використовуємо тільки прямий доступ 
             response = await self.llm_provider.generate_response(
                 message, 
                 context,
-                use_mcp=True,  # Дозволяємо використання MCP
+                use_mcp=True,
                 mcp_server_url=self.moodle_url,
-                mcp_token=self.auth.token
+                mcp_token=self.auth.token,
+                use_full_mcp_server=False  # Вимикаємо повний MCP
             )
             
-            # Оновлення останнього повідомлення в історії з відповіддю
+            # Оновлення повідомлення
             if self.messages:
                 self.messages[-1] = (message, response)
-            
-            # Обмеження довжини історії чату
-            if len(self.messages) > self.MAX_HISTORY_LENGTH:
-                self.messages = self.messages[-self.MAX_HISTORY_LENGTH:]
             
             return self.messages, ""
         except Exception as e:
             error_msg = f"Помилка отримання відповіді: {e}"
             print(error_msg)
-            import traceback
-            traceback.print_exc()
             
-            # Оновлення останнього повідомлення з помилкою
             if self.messages and self.messages[-1][0] == message:
                 self.messages[-1] = (message, error_msg)
             else:
                 self.messages.append((message, error_msg))
             
             return self.messages, ""
-    
+
     def clear_chat_history(self) -> List[Tuple[str, str]]:
         """Очищення історії чату."""
         self.messages = []
@@ -1653,3 +1645,64 @@ class TeacherDashboard:
             import traceback
             traceback.print_exc()
             return error_msg
+        
+    def switch_mcp_mode(self, mode: str) -> Tuple[Dict, str]:
+        """Перемикання режиму інтеграції з MCP."""
+        if mode == "Повний MCP сервер":
+            self.use_full_mcp_server = True
+            return gr.update(visible=True), "MCP сервер не запущено. Натисніть кнопку 'Запустити MCP сервер'."
+        else:
+            self.use_full_mcp_server = False
+            # Зупиняємо MCP сервер, якщо він запущений
+            if self.llm_provider:
+                try:
+                    status = self.llm_provider.stop_mcp_server()
+                    return gr.update(visible=False), f"Режим прямого доступу активовано. {status}"
+                except Exception as e:
+                    return gr.update(visible=False), f"Режим прямого доступу активовано. Помилка при зупинці MCP сервера: {e}"
+            return gr.update(visible=False), "Режим прямого доступу активовано."
+
+    async def start_mcp_server(self) -> Tuple[str, str]:
+        """Запуск MCP сервера."""
+        if not self.llm_provider:
+            try:
+                self.llm_provider = await LLMProviderFactory.create_provider("claude")
+            except Exception as e:
+                return f"Помилка ініціалізації LLM провайдера: {e}", ""  # Повертаємо два значення
+        
+        try:
+            # Проблема з аргументами - виправляємо виклик методу
+            # Не передаємо moodle_url у метод start_mcp_server об'єкта llm_provider
+            success, message, server_url = await self.llm_provider.start_mcp_server()
+            
+            if success and server_url:
+                # Генеруємо конфігурацію для Claude Desktop
+                config = {
+                    "mcpServers": {
+                        "moodle-assistant": {
+                            "command": sys.executable,
+                            "args": [
+                                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+                                            "mcp_server", "moodle_server.py"),
+                                "--base-url", self.moodle_url
+                            ]
+                        }
+                    }
+                }
+                config_json = json.dumps(config, indent=2)
+                return message, config_json
+            else:
+                return message, ""  # Повертаємо два значення
+        except Exception as e:
+            return f"Помилка запуску MCP сервера: {e}", ""  # Повертаємо два значення
+
+    def stop_mcp_server(self) -> str:
+        """Зупинка MCP сервера."""
+        if not self.llm_provider:
+            return "LLM провайдер не ініціалізовано."
+        
+        try:
+            status = self.llm_provider.stop_mcp_server()
+            return status
+        except Exception as e:
+            return f"Помилка зупинки MCP сервера: {e}"

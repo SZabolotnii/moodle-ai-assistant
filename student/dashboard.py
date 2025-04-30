@@ -31,6 +31,8 @@ class StudentDashboard:
         self.selected_course_name = None
         self.assignments = []
         self.chat_history = []
+
+        self.use_full_mcp_server = False  # За замовчуванням використовуємо прямий доступ
         
         # Константи для обмеження історії чату
         self.MAX_HISTORY_LENGTH = 50  # Максимальна кількість повідомлень у історії
@@ -99,6 +101,22 @@ class StudentDashboard:
                             # Історія чату
                             chat_history_output = gr.Chatbot(label="Історія чату", height=400)
                             
+                            # Вибір режиму інтеграції з MCP
+                            with gr.Row():
+                                gr.Markdown("#### Режим інтеграції з даними:")
+                                mcp_mode_selector = gr.Radio(
+                                    choices=["Прямий доступ до Moodle API", "Повний MCP сервер"],
+                                    value="Прямий доступ до Moodle API",
+                                    label="Режим взаємодії з Moodle",
+                                    info="Оберіть, як AI Асистент отримує дані з Moodle"
+                                )
+                                mcp_status = gr.Textbox(label="Статус MCP сервера", interactive=False)
+
+                            # Кнопки керування MCP сервером, видимі тільки в режимі повного MCP сервера
+                            with gr.Row(visible=False) as mcp_controls:
+                                start_mcp_button = gr.Button("Запустити MCP сервер")
+                                stop_mcp_button = gr.Button("Зупинити MCP сервер")
+
                             # Введення та відправка
                             with gr.Row():
                                 chat_input = gr.Textbox(label="Задайте питання", lines=2, placeholder="Наприклад: поясни мені тему цього курсу")
@@ -171,6 +189,24 @@ class StudentDashboard:
                 fn=self.clear_chat_history,
                 inputs=[],
                 outputs=[chat_history_output]
+            )
+
+            mcp_mode_selector.change(
+                fn=self.switch_mcp_mode,
+                inputs=[mcp_mode_selector],
+                outputs=[mcp_controls, mcp_status]
+            )
+
+            start_mcp_button.click(
+                fn=self.start_mcp_server,
+                inputs=[],
+                outputs=[mcp_status]
+            )
+
+            stop_mcp_button.click(
+                fn=self.stop_mcp_server,
+                inputs=[],
+                outputs=[mcp_status]
             )
         
         return dashboard
@@ -621,12 +657,14 @@ class StudentDashboard:
             # Отримання відповіді від LLM з використанням історії
             print(f"Відправка запиту до Claude з {len(messages)} повідомленнями в історії")
             
+            # Отримання відповіді від LLM 
             response = await self.llm_provider.generate_response(
                 message, 
                 context,
                 use_mcp=True,  # Дозволяємо використання MCP
-                mcp_server_url=self.moodle_url,
-                mcp_token=self.auth.token
+                mcp_server_url="auto" if self.use_full_mcp_server else self.moodle_url,
+                mcp_token=self.auth.token,
+                use_full_mcp_server=self.use_full_mcp_server
             )
             
             # Оновлення останнього повідомлення в історії з відповіддю
@@ -662,3 +700,44 @@ class StudentDashboard:
             return datetime.fromtimestamp(timestamp).strftime('%d.%m.%Y %H:%M')
         except Exception:
             return f"Timestamp: {timestamp}"
+        
+    def switch_mcp_mode(self, mode: str) -> Tuple[Dict, str]:
+        """Перемикання режиму інтеграції з MCP."""
+        if mode == "Повний MCP сервер":
+            self.use_full_mcp_server = True
+            return gr.update(visible=True), "MCP сервер не запущено. Натисніть кнопку 'Запустити MCP сервер'."
+        else:
+            self.use_full_mcp_server = False
+            # Зупиняємо MCP сервер, якщо він запущений
+            if self.llm_provider:
+                try:
+                    status = self.llm_provider.stop_mcp_server()
+                    return gr.update(visible=False), f"Режим прямого доступу активовано. {status}"
+                except Exception as e:
+                    return gr.update(visible=False), f"Режим прямого доступу активовано. Помилка при зупинці MCP сервера: {e}"
+            return gr.update(visible=False), "Режим прямого доступу активовано."
+
+    async def start_mcp_server(self) -> str:
+        """Запуск MCP сервера."""
+        if not self.llm_provider:
+            try:
+                self.llm_provider = await LLMProviderFactory.create_provider("claude")
+            except Exception as e:
+                return f"Помилка ініціалізації LLM провайдера: {e}"
+        
+        try:
+            success, message, _ = await self.llm_provider.start_mcp_server(self.moodle_url)
+            return message
+        except Exception as e:
+            return f"Помилка запуску MCP сервера: {e}"
+
+    def stop_mcp_server(self) -> str:
+        """Зупинка MCP сервера."""
+        if not self.llm_provider:
+            return "LLM провайдер не ініціалізовано."
+        
+        try:
+            status = self.llm_provider.stop_mcp_server()
+            return status
+        except Exception as e:
+            return f"Помилка зупинки MCP сервера: {e}"

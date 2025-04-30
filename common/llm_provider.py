@@ -2,11 +2,12 @@
 Модуль для взаємодії з різними LLM провайдерами.
 Забезпечує єдиний інтерфейс для роботи з різними моделями.
 """
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Tuple
 import httpx
 import json
 import os
 import asyncio
+import subprocess
 from abc import ABC, abstractmethod
 
 MAX_PROMPT_LENGTH = 10000
@@ -37,6 +38,8 @@ class ClaudeProvider(LLMProvider):
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         self.api_url = "https://api.anthropic.com/v1/messages"
         self.cache = {}  # Простий кеш відповідей
+        self.mcp_server_process = None  # Процес MCP сервера
+        self.mcp_server_url = None  # URL MCP сервера
         
         if not self.api_key:
             print("УВАГА: Змінна оточення ANTHROPIC_API_KEY не знайдена")
@@ -135,8 +138,136 @@ class ClaudeProvider(LLMProvider):
         
         return ""
     
-    async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None, use_mcp: bool = False, mcp_server_url: Optional[str] = None, mcp_token: Optional[str] = None) -> str:
+    async def start_mcp_server(self) -> Tuple[str, str]:
+        """Запуск MCP сервера."""
+        if not self.llm_provider:
+            try:
+                self.llm_provider = await LLMProviderFactory.create_provider("claude")
+            except Exception as e:
+                return f"Помилка ініціалізації LLM провайдера: {e}", ""
+        
+        try:
+            success, message, server_url = await self.llm_provider.start_mcp_server(self.moodle_url)
+            if success and server_url:
+                # Генеруємо конфігурацію для Claude Desktop
+                config = {
+                    "mcpServers": {
+                        "moodle-assistant": {
+                            "command": sys.executable,
+                            "args": [
+                                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+                                            "mcp_server", "moodle_server.py"),
+                                "--base-url", self.moodle_url
+                            ]
+                        }
+                    }
+                }
+                config_json = json.dumps(config, indent=2)
+                return message, config_json
+            else:
+                return message, ""
+        except Exception as e:
+            return f"Помилка запуску MCP сервера: {e}", ""
+    
+    def stop_mcp_server(self) -> str:
+        """Зупинка MCP сервера."""
+        if self.mcp_server_process and self.mcp_server_process.poll() is None:
+            print("Зупинка MCP сервера...")
+            self.mcp_server_process.terminate()
+            try:
+                stdout, stderr = self.mcp_server_process.communicate(timeout=5)
+                print("MCP сервер зупинено.")
+                if stderr:
+                    print(f"Помилки MCP сервера при зупинці: {stderr}")
+                self.mcp_server_process = None
+                return "MCP сервер зупинено"
+            except subprocess.TimeoutExpired:
+                print("MCP сервер не відповів на terminate, примусова зупинка (kill)...")
+                self.mcp_server_process.kill()
+                stdout, stderr = self.mcp_server_process.communicate()
+                print("MCP сервер примусово зупинено.")
+                self.mcp_server_process = None
+                return "MCP сервер примусово зупинено"
+        else:
+            print("Спроба зупинити MCP сервер, але він не запущений.")
+            return "MCP сервер не запущено"
+    
+    async def generate_response_via_mcp(self, prompt: str, context: Dict[str, Any], mcp_server_url: str, mcp_token: str) -> str:
+        """Генерація відповіді через MCP сервер."""
+        try:
+            print(f"Генерація відповіді через MCP сервер: {mcp_server_url}")
+            
+            # Оскільки ми маємо проблеми з прямою HTTP взаємодією з MCP, 
+            # використаємо інший підхід - виклик функцій MCP через Python API
+            
+            # Імпортуємо MCP клієнт
+            try:
+                from mcp_python import MCPClient, MCPClientConfig
+                config = MCPClientConfig(base_url=mcp_server_url)
+                client = MCPClient(config=config)
+                
+                # Підключаємося до MCP сервера
+                await client.connect()
+                
+                # Аутентифікуємося через токен
+                result = await client.invoke_tool("set_token", {
+                    "token": mcp_token
+                })
+                
+                if "успішно" not in result.lower():
+                    return f"Помилка аутентифікації в MCP: {result}"
+                
+                # Формуємо запит
+                system_prompt = context.get("system_prompt", "Ви корисний асистент для Moodle.")
+                
+                # Викликаємо LLM з контекстом
+                response = await client.invoke_tool("initialize_llm_provider", {
+                    "provider_name": "claude"
+                })
+                
+                # Отримуємо відповідь на наш запит
+                if context.get("selected_course") or context.get("course", {}).get("id"):
+                    course_id = context.get("selected_course") or context.get("course", {}).get("id")
+                    
+                    # Отримуємо дані через MCP для контексту
+                    await client.invoke_tool("get_course_content", {"course_id": course_id})
+                    await client.invoke_tool("get_course_students", {"course_id": course_id})
+                
+                # Відправляємо повідомлення до LLM через MCP
+                response = await client.chat(prompt, system=system_prompt)
+                return response
+            except ImportError:
+                return "Помилка: Модуль mcp_python не встановлено. Будь ласка, встановіть його за допомогою 'pip install mcp-python'"
+            except Exception as e:
+                return f"Помилка взаємодії з MCP через Python API: {str(e)}"
+                
+        except Exception as e:
+            return f"Помилка взаємодії з MCP сервером: {str(e)}"
+
+    async def generate_response(self, prompt: str, context: Optional[Dict[str, Any]] = None, use_mcp: bool = False, mcp_server_url: Optional[str] = None, mcp_token: Optional[str] = None, use_full_mcp_server: bool = False) -> str:
         """Генерація відповіді з використанням API Claude."""
+        if not context:
+            context = {}
+            
+        # Режим використання повного MCP сервера
+        if use_full_mcp_server and use_mcp and mcp_server_url and mcp_token:
+            # Перевіряємо, чи запущено MCP сервер
+            if mcp_server_url == "auto":
+                # Автоматичний запуск MCP сервера
+                moodle_base_url = context.get("moodle_base_url", "http://78.137.2.119:2929")
+                success, message, server_url = await self.start_mcp_server(moodle_base_url)
+                
+                if success and server_url:
+                    mcp_server_url = server_url
+                else:
+                    print(f"Не вдалося запустити MCP сервер: {message}. Переходимо до прямого режиму.")
+                    use_full_mcp_server = False
+            
+            # Якщо все налаштовано для використання повного MCP сервера
+            if use_full_mcp_server and mcp_server_url:
+                return await self.generate_response_via_mcp(prompt, context, mcp_server_url, mcp_token)
+        
+        # Звичайний режим прямого доступу до Moodle API
         print(f"Генерація відповіді для користувача {context.get('user_id')} в режимі {context.get('mode')}")
         if not self.api_key:
             return "Помилка: API ключ для Claude не налаштовано. Додайте ANTHROPIC_API_KEY у файл .env."
@@ -168,7 +299,7 @@ class ClaudeProvider(LLMProvider):
         
         # Отримуємо дані з MCP, якщо це потрібно
         mcp_context = ""
-        if use_mcp and mcp_server_url and mcp_token:
+        if use_mcp and mcp_server_url and mcp_token and not use_full_mcp_server:
             try:
                 mcp_context = await self._prepare_mcp_context(context, mcp_server_url, mcp_token)
                 if mcp_context:
